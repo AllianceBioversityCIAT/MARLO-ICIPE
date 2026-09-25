@@ -19,7 +19,6 @@
 [#assign isCrpProject = (action.isProjectCrpOrPlatform(project.id))!false ]
 [#assign isCenterProject = (action.isProjectCenter(project.id))!false ]
 [#assign isNewCenterTypeProject = (action.isNewCenterType(project.id))!false ]
-[#assign isManagementCluster = (action.isManagementCluster(project.id))!false ]
 
 [#if !action.isAiccra()]
   [#assign breadCrumb = [
@@ -122,8 +121,7 @@
                 [/#if]
               </div>
               [#-- Cluster Types --]
-              [#if action.isAiccra() && !isManagementCluster]  
-             
+              [#if !((project.projectInfo.administrative)!false)]
                 <div class="col-md-6">
                   [#if editable]
                     [@customForm.select name="project.projectInfo.clusterType.id" className="clusterType" i18nkey="project.clusterType" disabled=!editable listName="clusterTypes" keyFieldName="id" displayFieldName="name" required=true editable=true /]
@@ -184,7 +182,7 @@
 
             [#-- Project Summary --]
             <div class="form-group">
-              [@customForm.textArea name="project.projectInfo.summary"  i18nkey="project.summary" required=!((project.bilateralProject)!false) className="project-description limitWords-250" editable=editable && action.hasPermission("summary") /]
+              [@customForm.textArea name="project.projectInfo.summary"  i18nkey="project.summary" required=true className="project-description limitWords-250" editable=editable && action.hasPermission("summary") /]
             </div>
             
             [#-- Project Challenges, causes and proposed solutions --]
@@ -218,7 +216,7 @@
                 </div>
               </div>
               <div id="statusDescription" class="form-group" style="display:${project.projectInfo.statusJustificationRequired?string('block','none')}">
-                [@customForm.textArea name="project.projectInfo.statusJustification" i18nkey="project.statusJustification" required=!((project.bilateralProject)!false) className="project-statusJustification limitWords-100" editable=(editable || editStatus)   /]
+                [@customForm.textArea name="project.projectInfo.statusJustification" i18nkey="project.statusJustification" required=true className="project-statusJustification limitWords-100" editable=(editable || editStatus)   /]
               </div>
             </div>
 
