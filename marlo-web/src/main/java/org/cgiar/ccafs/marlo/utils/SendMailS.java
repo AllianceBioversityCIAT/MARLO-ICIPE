@@ -46,10 +46,14 @@ import javax.mail.internet.MimeMultipart;
 import javax.mail.util.ByteArrayDataSource;
 
 import com.opensymphony.xwork2.ActionContext;
+import com.opensymphony.xwork2.ActionProxy;
 import org.apache.commons.lang3.StringUtils;
 import org.hibernate.SessionFactory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.web.context.request.RequestAttributes;
+import org.springframework.web.context.request.RequestContextHolder;
+import org.springframework.web.context.request.ServletRequestAttributes;
 
 @Named
 public class SendMailS extends BaseAction {
@@ -61,6 +65,10 @@ public class SendMailS extends BaseAction {
 
   // LOG
   private static final Logger LOG = LoggerFactory.getLogger(SendMailS.class);
+
+  // source_action of an email sent outside any request. Kept apart from NULL, which is a row logged before the
+  // source was recorded at all.
+  static final String BACKGROUND_SOURCE = "background";
 
   // Managers
   private APConfig config;
@@ -106,6 +114,40 @@ public class SendMailS extends BaseAction {
   }
 
   /**
+   * Sets the TO of a message sent from a test environment the way send() does: the BCC when there is one, the TO
+   * otherwise. sendRetry() used to take the BCC unconditionally, so a row without BCC failed on every retry.
+   */
+  private void setTestRecipient(MimeMessage msg, String toEmail, String bbcEmail) throws MessagingException {
+    String recipient = bbcEmail != null ? bbcEmail : toEmail;
+    if (recipient != null) {
+      msg.setRecipients(Message.RecipientType.TO, InternetAddress.parse(recipient, false));
+    }
+    LOG.info("   - TO: {}", recipient);
+  }
+
+  /**
+   * Tells where the email being sent comes from, for the source_action column of email_logs: the Struts action of
+   * the request as "<namespace>/<action>", or the URI of a request served outside Struts (the REST endpoints).
+   *
+   * @return the source, or BACKGROUND_SOURCE for a send from a background thread, which has neither.
+   */
+  // Package-private so SendMailSSourceTest can call it.
+  String getRequestSource() {
+    ActionContext context = ActionContext.getContext();
+    if (context != null && context.getActionInvocation() != null
+      && context.getActionInvocation().getProxy() != null) {
+      ActionProxy proxy = context.getActionInvocation().getProxy();
+      String namespace = StringUtils.removeEnd(StringUtils.defaultString(proxy.getNamespace()), "/");
+      return StringUtils.left(namespace + "/" + StringUtils.defaultString(proxy.getActionName()), 255);
+    }
+    RequestAttributes attributes = RequestContextHolder.getRequestAttributes();
+    if (attributes instanceof ServletRequestAttributes) {
+      return StringUtils.left(((ServletRequestAttributes) attributes).getRequest().getRequestURI(), 255);
+    }
+    return BACKGROUND_SOURCE;
+  }
+
+  /**
    * Tells whether the email must go only to the support team, as set by the specificity crp_email_support_team.
    * When the CRP or the specificity cannot be read the email is restricted anyway: sending it to a real recipient
    * cannot be undone, while an email held back only reaches the support team.
@@ -113,9 +155,19 @@ public class SendMailS extends BaseAction {
    * @return true when the recipients must be replaced by the support team.
    */
   private boolean isRestrictedToSupport() {
-    Long crpID = this.getRequestCrpID();
+    return this.isRestrictedToSupport(this.getRequestCrpID());
+  }
+
+  /**
+   * The check of isRestrictedToSupport() for an email whose CRP is not the one of the request, such as a logged email
+   * resent by sendRetry(). A row logged before its CRP was recorded is restricted too, for the same reason.
+   *
+   * @param crpID the CRP the email was sent for, or null when it is unknown.
+   * @return true when the recipients must be replaced by the support team.
+   */
+  private boolean isRestrictedToSupport(Long crpID) {
     if (crpID == null) {
-      LOG.info("There is no CRP in the current request, so the email is sent only to the support team");
+      LOG.info("The email has no CRP, so it is sent only to the support team");
       return true;
     }
 
@@ -144,6 +196,23 @@ public class SendMailS extends BaseAction {
    * @return true when the email must not be sent at all.
    */
   private boolean isNotificationDisabled(String toEmail, String ccEmail, String bbcEmail, String subject) {
+    return this.isNotificationDisabled(this.getRequestCrpID(), toEmail, ccEmail, bbcEmail, subject);
+  }
+
+  /**
+   * Tells whether the given CRP has turned its email notifications off, as set by the specificity
+   * crp_enable_email_notification. It is the check of isNotificationDisabled(String, String, String, String) for an
+   * email whose CRP is not the one of the request, such as a logged email resent by sendRetry().
+   *
+   * @param crpID the CRP the email was sent for, or null when it is unknown, which keeps the email.
+   * @param toEmail the TO recipients of the email.
+   * @param ccEmail the CC recipients of the email.
+   * @param bbcEmail the BCC recipients of the email.
+   * @param subject the subject of the email, only to identify it in the log.
+   * @return true when the email must not be sent at all.
+   */
+  private boolean isNotificationDisabled(Long crpID, String toEmail, String ccEmail, String bbcEmail,
+    String subject) {
     // An email addressed only to the support team, such as the exception reports, is not a user notification.
     String supportEmail = this.config.getEmailNotification();
     boolean onlyToSupport = supportEmail != null && supportEmail.trim().equalsIgnoreCase(StringUtils.trim(toEmail))
@@ -153,7 +222,6 @@ public class SendMailS extends BaseAction {
       return false;
     }
 
-    Long crpID = this.getRequestCrpID();
     if (crpID == null) {
       return false;
     }
@@ -259,6 +327,8 @@ public class SendMailS extends BaseAction {
     }
 
     EmailLog emailLog = new EmailLog();
+    emailLog.setGlobalUnitId(this.getRequestCrpID());
+    emailLog.setSourceAction(this.getRequestSource());
     emailLog.setBbc(bbcEmail);
     emailLog.setCc(ccEmail);
     emailLog.setTo(toEmail);
@@ -371,7 +441,7 @@ public class SendMailS extends BaseAction {
       LOG.info("Message ID: \n" + msg.getMessageID());
       msg.setContent(mimeMultipart);
       // msgbackup.setContent(mimeMultipart);
-      ThreadSendMail thread = new ThreadSendMail(msg, subject, emailLogManager, emailLog, sessionFactory, config);
+      ThreadSendMail thread = new ThreadSendMail(msg, subject, emailLogManager, emailLog, config);
       thread.start();
 
     } catch (MessagingException e) {
@@ -380,10 +450,30 @@ public class SendMailS extends BaseAction {
     }
   }
 
+  /**
+   * Resends a logged email that failed. The retry runs from the session of the super administrator who starts it,
+   * for the logged emails of every CRP at once, so the CRP whose notification switch applies is the one recorded on
+   * the log row rather than the one of the request.
+   *
+   * It applies the support-team restriction of send() with that same CRP. Without it a retry from an environment
+   * that sends only to the support team reached the real recipients stored on the row, which are the ones of
+   * production in a copied database.
+   *
+   * @param globalUnitId the CRP recorded on the log row, or null for a row logged before it was recorded.
+   * @return true when the email was sent, false when it failed or was dropped because the notifications of its
+   *         CRP are off.
+   */
   public boolean sendRetry(String toEmail, String ccEmail, String bbcEmail, String subject, String messageContent,
-    byte[] attachment, String attachmentMimeType, String fileName, boolean isHtml) {
+    byte[] attachment, String attachmentMimeType, String fileName, boolean isHtml, Long globalUnitId) {
+    if (this.isNotificationDisabled(globalUnitId, toEmail, ccEmail, bbcEmail, subject)) {
+      return false;
+    }
+    if (this.isRestrictedToSupport(globalUnitId)) {
+      toEmail = this.config.getEmailNotification();
+      ccEmail = null;
+      bbcEmail = null;
+    }
 
-    // Get a Properties object
     Properties properties = System.getProperties();
     String[] ccEmails = null;
     if (ccEmail != null) {
@@ -402,9 +492,6 @@ public class SendMailS extends BaseAction {
       ccEmail = ccEmail + ", " + string;
     }
 
-    // properties.put("mail.smtp.auth", "true");
-    // properties.put("mail.smtp.starttls.enable", "true");
-    // properties.put("mail.smtp.ssl.trust", config.getEmailHost());
     properties.put("mail.smtp.host", config.getEmailHost());
     properties.put("mail.smtp.port", config.getEmailPort());
     // changes for smtp secure dperez
@@ -440,6 +527,7 @@ public class SendMailS extends BaseAction {
     }
 
     EmailLog emailLog = new EmailLog();
+    emailLog.setGlobalUnitId(this.getRequestCrpID());
     emailLog.setBbc(bbcEmail);
     emailLog.setCc(ccEmail);
     emailLog.setTo(bbcEmail);
@@ -466,10 +554,7 @@ public class SendMailS extends BaseAction {
         testingHeader.append("----------------------------------------------------<br><br>");
         subject = "TEST " + subject;
         messageContent = testingHeader.toString() + messageContent;
-        // if (toEmail != null) {
-        msg.setRecipients(Message.RecipientType.TO, InternetAddress.parse(bbcEmail, false));
-        LOG.info("   - TO: " + bbcEmail);
-        // }
+        this.setTestRecipient(msg, toEmail, bbcEmail);
       } else {
         if (toEmail != null) {
           msg.setRecipients(Message.RecipientType.TO, InternetAddress.parse(toEmail, false));
@@ -594,6 +679,8 @@ public class SendMailS extends BaseAction {
     }
 
     EmailLog emailLog = new EmailLog();
+    emailLog.setGlobalUnitId(this.getRequestCrpID());
+    emailLog.setSourceAction(this.getRequestSource());
     emailLog.setBbc(bbcEmail);
     emailLog.setCc(ccEmail);
     emailLog.setTo(toEmail);
@@ -706,7 +793,7 @@ public class SendMailS extends BaseAction {
       LOG.info("Message ID: \n" + msg.getMessageID());
       msg.setContent(mimeMultipart);
       // msgbackup.setContent(mimeMultipart);
-      ThreadSendMail thread = new ThreadSendMail(msg, subject, emailLogManager, emailLog, sessionFactory, config);
+      ThreadSendMail thread = new ThreadSendMail(msg, subject, emailLogManager, emailLog, config);
       thread.start();
 
     } catch (MessagingException e) {
