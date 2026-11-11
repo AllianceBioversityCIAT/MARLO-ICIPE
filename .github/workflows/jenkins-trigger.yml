@@ -1,9 +1,8 @@
 name: Trigger Jenkins Job Java 17 (STAGING)
 
 on:
-  push:
-    branches:
-      - "main"
+  # main removed (MARLO-FSRP PROD cutover): a push to main runs fsrp-prod-ci.yml -> marlo-fsrp-main-cd.
+  # The legacy job marlo-fsrp-main stays available through workflow_dispatch from main (manual recovery).
   workflow_dispatch:
 
 jobs:
